@@ -3,4 +3,5 @@ MANIFEST
 README
 t/PDFLib-PPS.t
 lib/PDFLib/PPS.pm
+lib/PDFLib/ZapfChars.pm
 META.yml                                 Module meta-data (added by MakeMaker)

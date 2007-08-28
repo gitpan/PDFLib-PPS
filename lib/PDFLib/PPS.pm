@@ -3,15 +3,37 @@ package PDFLib::PPS;
 use strict;
 use base 'PDFLib';
 use pdflib_pl 7.0;
+use PDFLib::ZapfChars;
 
 use constant { ERROR => -1 };
 
-our $VERSION = '0.01';
+our $VERSION = '0.04';
+
+if ($ARGV[0]) {
+  my $pdf = PDFLib::PPS->new(BlockContainer => $ARGV[0]);
+  $pdf->print_block_info;
+  exit;
+}
 
 sub new {
   my $class = shift;
   my $pdf = $class->SUPER::new(@_);
   return $pdf;
+}
+
+sub flowhandle {
+  my ($pdf, $field_name, $handle) = @_;
+  if (defined $handle) {
+    $pdf->{FlowHandles}{$field_name} = $handle;
+  }
+  return defined $pdf->{FlowHandles}{$field_name} 
+    ? $pdf->{FlowHandles}{$field_name} : -1;
+}
+
+  
+sub zapfchar {
+  my ($pdf, $name) = @_;
+  return sprintf('%c', $PDFLib::ZapfChars{$name});
 }
 
 sub search_path {
@@ -62,14 +84,26 @@ sub current_page {
   return $pdf->{page};
 }
 
+sub parse_datum {
+  my ($pdf, $datum) = @_;
+  return $datum unless ref $datum eq 'HASH';
+  
+  my $text = $datum->{text};
+  my $override_encoding = exists $datum->{encoding} ? "Yes" : undef;
+  my $options = join " " => 
+    map { sprintf "%s=%s", $_, $datum->{$_} } grep { not /text/ } keys %$datum;
+
+  return ($text, $options, $override_encoding);
+}
 
 sub fill_in {
-  my $pdf = shift;
+  my ($pdf, $verbose) = @_;
 
   my $container = $pdf->open_pdi_document;
   defined $container ? $pdf->container($container) : return undef;
 
   for my $page_no (1 .. $pdf->number_of_pages) {
+    print STDERR "[PPS] processing page number $page_no\n" if $verbose;
 
     # open the template page.
     my $page = $pdf->open_pdi_page($page_no);
@@ -78,12 +112,32 @@ sub fill_in {
     # create a new document page.
     $pdf->begin_page_ext;
 
-    for my $block_name ($pdf->block_names) {
+    for my $block_name (sort $pdf->block_names) {
       my $encoding = $pdf->encoding_for_block($block_name);
-      my $fill = PDF_fill_textblock($pdf->_pdf, $pdf->current_page, 
-				    $block_name, $pdf->block_datum($block_name),
-				    $encoding);
+
+      my ($text, $font_spec, $override_encoding) = 
+	$pdf->parse_datum($pdf->block_datum($block_name));
+      $encoding = $override_encoding ? $font_spec : "$encoding $font_spec";
+
+      if ($pdf->is_textflow($block_name)) {
+	$encoding .= sprintf " textflowhandle=%s textflow=true $font_spec ", 
+	  $pdf->flowhandle($block_name);
+	print STDERR "$block_name encoding: ($font_spec) $encoding\n" 
+	  if $verbose;
+      }
+
+      my $fill = 
+	PDF_fill_textblock($pdf->_pdf, $pdf->current_page, 
+			   $block_name, $text, "$encoding");
       if ($fill == ERROR) { return undef }
+
+      if ($pdf->is_textflow($block_name)) {
+	$pdf->flowhandle($block_name, $fill);
+      }
+
+      print STDERR 
+	"[page $page_no]\tfilled in $block_name with $text ($encoding)\n"
+	if $verbose;
     }
     
     $pdf->end_page_ext;
@@ -92,6 +146,42 @@ sub fill_in {
 
   $pdf->close_pdi_document;
   return "OK";
+}
+
+sub block_info {
+  my $pdf = shift;
+
+  my $container = $pdf->open_pdi_document;
+  defined $container ? $pdf->container($container) : return undef;
+
+  my %info = ();
+  for my $page_no (1 .. $pdf->number_of_pages) {
+
+    # open the template page.
+    my $page = $pdf->open_pdi_page($page_no);
+    defined $page ? $pdf->current_page($page) : return undef;
+
+    for my $block_name ($pdf->block_names) {
+      my $font = $pdf->font_for_block($block_name);
+      push @{ $info{$page_no} } => [$block_name, $font];
+    }
+    
+    $pdf->close_pdi_page;
+  }
+  return wantarray ? %info : \%info;
+}
+
+sub print_block_info {
+  my $pdf = shift;
+  my %info = $pdf->block_info;
+  for my $page (sort keys %info) {
+    print "Page $page ", '-' x 70, "\n";
+    for my $block (@{ $info{$page} }) {
+      my ($name, $font) = @$block;
+      my $spacer = " " x (40 - length $name);
+      print "\t$name $spacer $font\n";
+    }
+  }
 }
 
 sub end_page_ext {
@@ -116,21 +206,36 @@ sub encoding_for_block {
   }
 }
 
+sub get_pdi_parameter {
+  my ($pdf, $path) = @_;
+  return PDF_get_pdi_parameter($pdf->_pdf, $path, 
+			       $pdf->container, $pdf->current_page, 0);
+}
+
+sub is_textflow {
+  my ($pdf, $block_name) = @_;
+  return lc $pdf->field_type($block_name) eq 'textflow' ? 1 : undef;
+}
+
+sub field_type {
+  my ($pdf, $block_name) = @_;
+  return 
+    $pdf->get_pdi_parameter("vdp/Blocks/$block_name/Custom/PDFlib:field:type");
+}
+
 sub font_for_block {
   my ($pdf, $block_name) = @_;
-  my $font = 
-    PDF_get_pdi_parameter($pdf->_pdf, "vdp/Blocks/$block_name/fontname",
-			  $pdf->container, $pdf->current_page, 0);
-  return $font;
+  return $pdf->get_pdi_parameter("vdp/Blocks/$block_name/fontname");
 }
 
 sub block_names {
   my $pdf = shift;
   my $count = $pdf->block_count;
-  return map { PDF_get_pdi_parameter($pdf->_pdf, "vdp/Blocks[$_]/Name",
-				   $pdf->container, $pdf->current_page, 0) }
+  return map { $pdf->get_pdi_parameter("vdp/Blocks[$_]/Name") }
     (0 .. ($pdf->block_count - 1));
 }
+
+
 
 sub block_count {
   my $pdf = shift;
@@ -227,13 +332,37 @@ The object creation is delegated to PDFLib; see the PDFLib perldoc for
 details.  There are three additional parameters which might be useful:
 SearchPath (which is then set as the SearchPath parameter),
 BlockContainer (the PDF document with the named blocks defined within,
-maybe well thought of as a 'template'), and BlockData (a hashref of
+maybe well thought of as a "template"), and BlockData (a hashref of
 block-name => block-text pairs).
+
+NB: the block-text specified in BlockData can be text, in which case
+the fill_in method attempts to use a reasonable encoding, font,
+textsize, and so forth or it can be a hashref.  If a hashref is
+specified, one key, "text", represents the text for the field, each of
+the other keys/value pairs will be passed as a key=value option to
+PDF_fill_textblock.  If "encoding" is one of the keys, that encoding
+will be used instead of whichever encoding PPS.pm had magically
+selected.  (See zapfchar() below for a brief example.)
+
 
 =head2 fill_in()
 
 Shoves BlockData into the BlockContainer specified.  Returns undef on
 error or the string "OK" upon success.  
+
+All identically named blocks with the block property
+"PDFlib:field:type" set to "textflow" will be considered a single
+textflow block.  This is experimental and fraught with peril.
+
+=head2 zapfchar(unicode character name)
+
+Return the ASCII character that will produce the unicode character
+supplied.  For instance, to fill in a checkbox block named
+"GenderMale" with a 16 pt checkmark:
+
+  my $checkmark = PDFLib::PPS->zapfchar('CheckMark');
+  $pdf->block_datum(GenderMale => { text => $checkmark, fontsize => 16 });
+
 
 =head1 GET/SET Methods
 
